@@ -13,30 +13,27 @@ void test() {
 
   // CHECK: call void @llvm.lifetime.start.p0(ptr nonnull %[[AGG1]])
   // CHECK: invoke void @_Z16func_that_throws7Trivial(ptr noundef nonnull byval(%struct.Trivial) align 8 %[[AGG1]])
-  // CHECK-NEXT: to label %[[CONT1:.*]] unwind label %[[LPAD1:.*]]
-  
+  // CHECK-NEXT: to label %[[CONT1:.*]] unwind label %[[LPAD:.*]]
+
   // CHECK: [[CONT1]]:
+  // CHECK-NEXT: call void @llvm.lifetime.end.p0(ptr nonnull %[[AGG1]])
   // CHECK-NEXT: call void @llvm.lifetime.start.p0(ptr nonnull %[[AGG2]])
   // CHECK: invoke void @_Z16func_that_throws7Trivial(ptr noundef nonnull byval(%struct.Trivial) align 8 %[[AGG2]])
-  // CHECK-NEXT: to label %[[CONT2:.*]] unwind label %[[LPAD2:.*]]
+  // CHECK-NEXT: to label %[[CONT2:.*]] unwind label %[[LPAD]]
 
   // CHECK: [[CONT2]]:
-  // CHECK-DAG: call void @llvm.lifetime.end.p0(ptr nonnull %[[AGG2]])
-  // CHECK-DAG: call void @llvm.lifetime.end.p0(ptr nonnull %[[AGG1]])
+  // CHECK-NEXT: call void @llvm.lifetime.end.p0(ptr nonnull %[[AGG2]])
   // CHECK: br label %[[TRY_CONT:.*]]
 
-  // CHECK: [[LPAD1]]:
+  // CHECK: [[LPAD]]:
   // CHECK: landingpad
-  // CHECK: br label %[[EHCLEANUP:.*]]
-
-  // CHECK: [[LPAD2]]:
-  // CHECK: landingpad
-  // CHECK: call void @llvm.lifetime.end.p0(ptr nonnull %[[AGG2]])
-  // CHECK: br label %[[EHCLEANUP]]
-
-  // CHECK: [[EHCLEANUP]]:
-  // CHECK: call void @llvm.lifetime.end.p0(ptr nonnull %[[AGG1]])
+  // CHECK-NOT: call void @llvm.lifetime.end.p0(ptr nonnull %[[AGG1]])
+  // CHECK-NOT: call void @llvm.lifetime.end.p0(ptr nonnull %[[AGG2]])
   // CHECK: call ptr @__cxa_begin_catch
+  // CHECK: br label %[[TRY_CONT]]
+
+  // CHECK: [[TRY_CONT]]:
+  // CHECK-NEXT: ret void
   try {
     func_that_throws(Trivial{0});
     func_that_throws(Trivial{0});
