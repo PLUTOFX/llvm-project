@@ -20,7 +20,6 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/InstructionSimplify.h"
@@ -64,11 +63,14 @@ STATISTIC(NumPHIInsert,     "Number of PHI nodes inserted");
 bool llvm::isAllocaPromotable(const AllocaInst *AI) {
   if (const auto *PtrTy = dyn_cast<PointerType>(AI->getAllocatedType())) {
     if (PtrTy->getAddressSpace() == 0) {
-      if (const Function *F = AI->getFunction()) {
-        if (const Module *M = F->getParent()) {
-          if (Triple(M->getTargetTriple()).isWasm())
-            return false;
-        }
+      const Function *F = AI->getFunction();
+      const Module *M = F ? F->getParent() : nullptr;
+      StringRef TargetTriple = M ? M->getTargetTriple() : StringRef();
+      if (TargetTriple.starts_with("wasm32") ||
+          TargetTriple.starts_with("wasm64")) {
+        // Keep pointer allocas on the linear memory stack for wasm so
+        // shadow-stack style GCs can observe them across calls.
+        return false;
       }
     }
   }
