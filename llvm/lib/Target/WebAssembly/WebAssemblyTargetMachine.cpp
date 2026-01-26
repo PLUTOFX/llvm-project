@@ -83,6 +83,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeWebAssemblyTarget() {
   initializeWebAssemblyLowerRefTypesIntPtrConvPass(PR);
   initializeWebAssemblyFixBrTableDefaultsPass(PR);
   initializeWebAssemblyDAGToDAGISelPass(PR);
+  initializeWebAssemblySpillPointersPass(PR);
 }
 
 //===----------------------------------------------------------------------===//
@@ -566,6 +567,11 @@ void WebAssemblyPassConfig::addPreEmitPass() {
     // that become stackified.
     addPass(createWebAssemblyRegColoring());
   }
+
+  // Spill pointer-typed values to shadow stack for GC.
+  // This must run after register allocation but before explicit locals.
+  if (getOptLevel() != CodeGenOpt::None)
+    addPass(createWebAssemblySpillPointers());
 
   // Sort the blocks of the CFG into topological order, a prerequisite for
   // BLOCK and LOOP markers.
