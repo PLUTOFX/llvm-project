@@ -20,6 +20,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/InstructionSimplify.h"
@@ -61,6 +62,16 @@ STATISTIC(NumDeadAlloca,    "Number of dead alloca's removed");
 STATISTIC(NumPHIInsert,     "Number of PHI nodes inserted");
 
 bool llvm::isAllocaPromotable(const AllocaInst *AI) {
+  if (const auto *PtrTy = dyn_cast<PointerType>(AI->getAllocatedType())) {
+    if (PtrTy->getAddressSpace() == 0) {
+      if (const Function *F = AI->getFunction()) {
+        if (const Module *M = F->getParent()) {
+          if (Triple(M->getTargetTriple()).isWasm())
+            return false;
+        }
+      }
+    }
+  }
   // Only allow direct and non-volatile loads and stores...
   for (const User *U : AI->users()) {
     if (const LoadInst *LI = dyn_cast<LoadInst>(U)) {
