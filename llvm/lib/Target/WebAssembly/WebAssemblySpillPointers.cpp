@@ -229,16 +229,47 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "  Found " << PointerRegs.size()
                     << " potential pointer registers\n");
 
-  // Allocate frame index slots for spilling pointers
+  // First pass: determine which potential pointer vregs are live at any call.
+  // Only allocate spill slots for those that actually need spilling to avoid
+  // creating unnecessary stack frame space.
+  DenseSet<Register> NeedSpill;
+  for (auto &MBB : MF) {
+    for (auto &MI : MBB) {
+      if (!MI.isCall())
+        continue;
+      SlotIndex CallIdx = LIS.getInstructionIndex(MI);
+      for (Register Reg : PointerRegs) {
+        if (NeedSpill.count(Reg))
+          continue;
+        if (LIS.hasInterval(Reg)) {
+          auto &LI = LIS.getInterval(Reg);
+          if (LI.liveAt(CallIdx))
+            NeedSpill.insert(Reg);
+        }
+      }
+    }
+  }
+
+  if (NeedSpill.empty()) {
+    LLVM_DEBUG(dbgs() << "  No pointers live across calls, skipping\n");
+    return false;
+  }
+
+  LLVM_DEBUG(dbgs() << "  " << NeedSpill.size()
+                    << " pointer registers need spilling\n");
+
+  // Allocate frame index slots only for vregs that need spilling
   DenseMap<Register, int> SpillSlots;
   for (Register Reg : PointerRegs) {
+    if (!NeedSpill.count(Reg))
+      continue;
     int FI = MFI.CreateSpillStackObject(PtrSize, Align(PtrSize));
     SpillSlots[Reg] = FI;
     LLVM_DEBUG(dbgs() << "  Allocated frame slot " << FI << " for "
                       << printReg(Reg, TRI) << "\n");
   }
 
-  // Scan for function calls and insert spills before them
+  // Second pass: insert spill stores before each call
   for (auto &MBB : MF) {
     for (auto MII = MBB.begin(); MII != MBB.end(); ++MII) {
       MachineInstr &MI = *MII;
@@ -249,14 +280,15 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
       LLVM_DEBUG(dbgs() << "  Found call at: " << MI);
 
       // Find which pointer registers are live at this call
+      SlotIndex CallIdx = LIS.getInstructionIndex(MI);
       SmallVector<Register, 8> LivePointers;
       for (Register Reg : PointerRegs) {
+        if (!NeedSpill.count(Reg))
+          continue;
         if (LIS.hasInterval(Reg)) {
           auto &LI = LIS.getInterval(Reg);
-          SlotIndex CallIdx = LIS.getInstructionIndex(MI);
-          if (LI.liveAt(CallIdx)) {
+          if (LI.liveAt(CallIdx))
             LivePointers.push_back(Reg);
-          }
         }
       }
 
