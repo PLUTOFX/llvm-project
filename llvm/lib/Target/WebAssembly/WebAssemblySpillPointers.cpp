@@ -16,14 +16,24 @@
 /// making sure all pointer values that are live across calls are visible in
 /// linear memory where the GC can find them.
 ///
+/// Instead of conservatively spilling all I32/I64 registers, this pass performs
+/// a dataflow analysis to identify which virtual registers actually hold
+/// potential pointer values. Seed pointers are identified from call results,
+/// memory loads, function arguments, and global gets. Pointer-ness is then
+/// propagated through ADD, SUB, SELECT, COPY, and PHI instructions. Registers
+/// defined by pure arithmetic (MUL, DIV, REM), bitwise, comparison, constant,
+/// or conversion instructions are not treated as pointers.
+///
 /// The pass runs after register allocation but before ExplicitLocals, so it
 /// can work with virtual registers and insert machine instructions.
 ///
 //===----------------------------------------------------------------------===//
 
 #include "WebAssembly.h"
+#include "MCTargetDesc/WebAssemblyMCTargetDesc.h"
 #include "WebAssemblyMachineFunctionInfo.h"
 #include "WebAssemblySubtarget.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -38,6 +48,38 @@ using namespace llvm;
 #define DEBUG_TYPE "wasm-spill-pointers"
 
 namespace {
+
+/// Returns true if the opcode is an ADD or SUB that could represent pointer
+/// arithmetic (e.g., base + offset from GEP lowering).
+static bool isPointerArithmeticOpcode(unsigned Opc) {
+  switch (Opc) {
+  case WebAssembly::ADD_I32:
+  case WebAssembly::ADD_I32_S:
+  case WebAssembly::ADD_I64:
+  case WebAssembly::ADD_I64_S:
+  case WebAssembly::SUB_I32:
+  case WebAssembly::SUB_I32_S:
+  case WebAssembly::SUB_I64:
+  case WebAssembly::SUB_I64_S:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// Returns true if the opcode is a SELECT that could propagate pointer values.
+static bool isSelectOpcode(unsigned Opc) {
+  switch (Opc) {
+  case WebAssembly::SELECT_I32:
+  case WebAssembly::SELECT_I32_S:
+  case WebAssembly::SELECT_I64:
+  case WebAssembly::SELECT_I64_S:
+    return true;
+  default:
+    return false;
+  }
+}
+
 class WebAssemblySpillPointers final : public MachineFunctionPass {
   StringRef getPassName() const override {
     return "WebAssembly Spill Pointers to Shadow Stack";
@@ -72,6 +114,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   });
 
   const auto *TII = MF.getSubtarget<WebAssemblySubtarget>().getInstrInfo();
+  const auto *TRI = MF.getSubtarget<WebAssemblySubtarget>().getRegisterInfo();
   auto &MRI = MF.getRegInfo();
   auto &LIS = getAnalysis<LiveIntervals>();
   auto &MFI = MF.getFrameInfo();
@@ -80,20 +123,102 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   // Determine if we're in 32-bit or 64-bit mode
   bool Is64Bit = MF.getSubtarget<WebAssemblySubtarget>().hasAddr64();
   int PtrSize = Is64Bit ? 8 : 4;
-  
-  // Collect pointer-typed virtual registers
-  // In WebAssembly, pointers are i32 or i64 depending on address size
+
+  // --- Pointer classification via dataflow analysis ---
+  // Phase 1: Identify "seed" potential pointers from instructions that can
+  // produce pointer values.
+  DenseSet<Register> PotentialPointers;
+
+  for (auto &MBB : MF) {
+    for (auto &MI : MBB) {
+      for (unsigned I = 0, E = MI.getNumOperands(); I < E; ++I) {
+        const MachineOperand &MO = MI.getOperand(I);
+        if (!MO.isReg() || !MO.isDef() || !MO.getReg().isVirtual())
+          continue;
+
+        Register DefReg = MO.getReg();
+        if (MRI.reg_nodbg_empty(DefReg))
+          continue;
+
+        const auto *RC = MRI.getRegClass(DefReg);
+        if (RC != &WebAssembly::I32RegClass &&
+            RC != &WebAssembly::I64RegClass)
+          continue;
+
+        unsigned Opc = MI.getOpcode();
+
+        // Call results could be pointers (e.g., malloc, GC_malloc).
+        if (MI.isCall()) {
+          PotentialPointers.insert(DefReg);
+          continue;
+        }
+
+        // Values loaded from memory could be pointers (LOAD, GLOBAL_GET, etc.)
+        if (MI.mayLoad()) {
+          PotentialPointers.insert(DefReg);
+          continue;
+        }
+
+        // Function arguments could be pointers.
+        if (WebAssembly::isArgument(Opc)) {
+          PotentialPointers.insert(DefReg);
+          continue;
+        }
+      }
+    }
+  }
+
+  // Phase 2: Propagate pointer-ness through dataflow.
+  // Instructions that can propagate a pointer value from an operand to their
+  // result: ADD/SUB (pointer arithmetic), SELECT, COPY, PHI.
+  bool Propagated = true;
+  while (Propagated) {
+    Propagated = false;
+    for (auto &MBB : MF) {
+      for (auto &MI : MBB) {
+        for (unsigned I = 0, E = MI.getNumOperands(); I < E; ++I) {
+          const MachineOperand &MO = MI.getOperand(I);
+          if (!MO.isReg() || !MO.isDef() || !MO.getReg().isVirtual())
+            continue;
+
+          Register DefReg = MO.getReg();
+          if (PotentialPointers.count(DefReg))
+            continue;
+
+          const auto *RC = MRI.getRegClass(DefReg);
+          if (RC != &WebAssembly::I32RegClass &&
+              RC != &WebAssembly::I64RegClass)
+            continue;
+
+          unsigned Opc = MI.getOpcode();
+
+          // Only propagate through pointer-preserving instructions.
+          if (!isPointerArithmeticOpcode(Opc) && !isSelectOpcode(Opc) &&
+              !MI.isCopy() && !MI.isPHI())
+            continue;
+
+          // Check if any register use operand is a potential pointer.
+          for (unsigned J = 0, JE = MI.getNumOperands(); J < JE; ++J) {
+            const MachineOperand &UseOp = MI.getOperand(J);
+            if (!UseOp.isReg() || UseOp.isDef() || !UseOp.getReg().isVirtual())
+              continue;
+            if (PotentialPointers.count(UseOp.getReg())) {
+              PotentialPointers.insert(DefReg);
+              Propagated = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Build the final list of pointer registers
   SmallVector<Register, 16> PointerRegs;
   for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
     Register Reg = Register::index2VirtReg(I);
-    if (!MRI.reg_nodbg_empty(Reg)) {
-      const auto *RC = MRI.getRegClass(Reg);
-      // Treat all I32/I64 registers as potential pointers
-      // (conservative but safe for GC)
-      if (RC == &WebAssembly::I32RegClass || RC == &WebAssembly::I64RegClass) {
-        PointerRegs.push_back(Reg);
-      }
-    }
+    if (PotentialPointers.count(Reg))
+      PointerRegs.push_back(Reg);
   }
 
   if (PointerRegs.empty()) {
@@ -101,24 +226,23 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
     return false;
   }
 
-  LLVM_DEBUG(dbgs() << "  Found " << PointerRegs.size() << " pointer registers\n");
+  LLVM_DEBUG(dbgs() << "  Found " << PointerRegs.size()
+                    << " potential pointer registers\n");
 
   // Allocate frame index slots for spilling pointers
   DenseMap<Register, int> SpillSlots;
   for (Register Reg : PointerRegs) {
-    // Create a stack slot for this pointer
     int FI = MFI.CreateSpillStackObject(PtrSize, Align(PtrSize));
     SpillSlots[Reg] = FI;
     LLVM_DEBUG(dbgs() << "  Allocated frame slot " << FI << " for "
-                      << printReg(Reg, TII->getRegisterInfo()) << "\n");
+                      << printReg(Reg, TRI) << "\n");
   }
 
   // Scan for function calls and insert spills before them
   for (auto &MBB : MF) {
     for (auto MII = MBB.begin(); MII != MBB.end(); ++MII) {
       MachineInstr &MI = *MII;
-      
-      // Check if this is a function call
+
       if (!MI.isCall())
         continue;
 
@@ -141,15 +265,14 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
         continue;
       }
 
-      LLVM_DEBUG(dbgs() << "    Spilling " << LivePointers.size() 
+      LLVM_DEBUG(dbgs() << "    Spilling " << LivePointers.size()
                         << " live pointers\n");
 
       // Insert stores before the call for each live pointer
       for (Register Reg : LivePointers) {
         int FI = SpillSlots[Reg];
         const auto *RC = MRI.getRegClass(Reg);
-        
-        // Determine the appropriate store opcode
+
         unsigned StoreOpcode;
         if (Is64Bit && RC == &WebAssembly::I64RegClass) {
           StoreOpcode = WebAssembly::STORE_I64_A64;
@@ -161,17 +284,14 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           StoreOpcode = WebAssembly::STORE_I64_A32;
         }
 
-        // Build: STORE p2align, offset, addr, val
-        // This stores val to memory at [addr + offset]
-        // We use the frame index as the address
         BuildMI(MBB, MII, MI.getDebugLoc(), TII->get(StoreOpcode))
             .addImm(0)            // p2align
-            .addImm(0)            // offset  
+            .addImm(0)            // offset
             .addFrameIndex(FI)    // address (frame index)
             .addReg(Reg);         // value to store
 
-        LLVM_DEBUG(dbgs() << "      Spilled " 
-                          << printReg(Reg, TII->getRegisterInfo())
+        LLVM_DEBUG(dbgs() << "      Spilled "
+                          << printReg(Reg, TRI)
                           << " to frame slot " << FI << "\n");
         Changed = true;
       }
