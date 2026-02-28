@@ -46,7 +46,6 @@ class WebAssemblySpillPointers final : public MachineFunctionPass {
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
     AU.addRequired<LiveIntervals>();
-    AU.addPreserved<LiveIntervals>();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 

@@ -525,6 +525,11 @@ void WebAssemblyPassConfig::addPostRegAlloc() {
   // control flow.
   disablePass(&MachineBlockPlacementID);
 
+  // Spill pointer-typed values to shadow stack for GC.
+  // This must run before PEI so that frame indices are properly resolved.
+  if (getOptLevel() != CodeGenOpt::None)
+    addPass(createWebAssemblySpillPointers());
+
   TargetPassConfig::addPostRegAlloc();
 }
 
@@ -567,11 +572,6 @@ void WebAssemblyPassConfig::addPreEmitPass() {
     // that become stackified.
     addPass(createWebAssemblyRegColoring());
   }
-
-  // Spill pointer-typed values to shadow stack for GC.
-  // This must run after register allocation but before explicit locals.
-  if (getOptLevel() != CodeGenOpt::None)
-    addPass(createWebAssemblySpillPointers());
 
   // Sort the blocks of the CFG into topological order, a prerequisite for
   // BLOCK and LOOP markers.
