@@ -75,3 +75,40 @@ entry:
   call void @use_int(i32 %prod)
   ret void
 }
+
+; Test: AND-based pointer alignment should be spilled.
+; ptr & ~0xF aligns a pointer down - the result is still a valid pointer that
+; the GC must be able to find.
+;
+; CHECK-LABEL: test_and_alignment:
+; CHECK: call {{.*}}GC_malloc
+; CHECK: i32.and
+; CHECK: i32.store
+; CHECK: call {{.*}}GC_gcollect
+define ptr @test_and_alignment() {
+entry:
+  %p = call ptr @GC_malloc(i32 32)
+  %i = ptrtoint ptr %p to i32
+  %aligned = and i32 %i, -16
+  %q = inttoptr i32 %aligned to ptr
+  call void @GC_gcollect()
+  ret ptr %q
+}
+
+; Test: OR-based pointer tagging should be spilled.
+; ptr | 1 sets a tag bit but the value is still recognizable as a pointer.
+;
+; CHECK-LABEL: test_or_tagging:
+; CHECK: call {{.*}}GC_malloc
+; CHECK: i32.or
+; CHECK: i32.store
+; CHECK: call {{.*}}GC_gcollect
+define ptr @test_or_tagging() {
+entry:
+  %p = call ptr @GC_malloc(i32 16)
+  %i = ptrtoint ptr %p to i32
+  %tagged = or i32 %i, 1
+  %q = inttoptr i32 %tagged to ptr
+  call void @GC_gcollect()
+  ret ptr %q
+}
