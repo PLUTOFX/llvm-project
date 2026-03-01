@@ -20,9 +20,18 @@
 /// a dataflow analysis to identify which virtual registers actually hold
 /// potential pointer values. Seed pointers are identified from call results,
 /// memory loads, function arguments, and global gets. Pointer-ness is then
-/// propagated through ADD, SUB, SELECT, COPY, and PHI instructions. Registers
-/// defined by pure arithmetic (MUL, DIV, REM), bitwise, comparison, constant,
-/// or conversion instructions are not treated as pointers.
+/// propagated through a blocklist approach: any I32/I64-producing instruction
+/// whose input includes a potential pointer will propagate pointer-ness to its
+/// result, UNLESS the instruction is on a blocklist of operations that
+/// definitely destroy pointer structure. This blocklist includes MUL, DIV, REM,
+/// SHL, SHR, ROT, CLZ, CTZ, POPCNT, XOR, and comparisons. Operations like
+/// ADD, SUB, AND, OR, SELECT, COPY, PHI, and type conversions (WRAP, EXTEND)
+/// propagate pointer-ness because they can preserve recognizable pointer values
+/// (e.g., AND for alignment, OR for tagging, ADD/SUB for GEP offsets).
+///
+/// The blocklist approach is safer than an allowlist for conservative GC: any
+/// unknown or newly-added instruction defaults to propagating pointer-ness,
+/// which may cause some unnecessary spills but will never miss a real pointer.
 ///
 /// The pass runs after register allocation but before ExplicitLocals, so it
 /// can work with virtual registers and insert machine instructions.
@@ -49,31 +58,120 @@ using namespace llvm;
 
 namespace {
 
-/// Returns true if the opcode is an ADD or SUB that could represent pointer
-/// arithmetic (e.g., base + offset from GEP lowering).
-static bool isPointerArithmeticOpcode(unsigned Opc) {
+/// Returns true if an instruction's I32/I64 result is definitely not a pointer,
+/// even if some of its inputs are pointers. This blocklist approach means any
+/// instruction NOT listed here will conservatively propagate pointer-ness from
+/// its inputs to its output, ensuring no real pointers are missed.
+static bool isDefinitelyNotPointerResult(unsigned Opc) {
   switch (Opc) {
-  case WebAssembly::ADD_I32:
-  case WebAssembly::ADD_I32_S:
-  case WebAssembly::ADD_I64:
-  case WebAssembly::ADD_I64_S:
-  case WebAssembly::SUB_I32:
-  case WebAssembly::SUB_I32_S:
-  case WebAssembly::SUB_I64:
-  case WebAssembly::SUB_I64_S:
-    return true;
-  default:
-    return false;
-  }
-}
-
-/// Returns true if the opcode is a SELECT that could propagate pointer values.
-static bool isSelectOpcode(unsigned Opc) {
-  switch (Opc) {
-  case WebAssembly::SELECT_I32:
-  case WebAssembly::SELECT_I32_S:
-  case WebAssembly::SELECT_I64:
-  case WebAssembly::SELECT_I64_S:
+  // Multiplication destroys pointer structure
+  case WebAssembly::MUL_I32:
+  case WebAssembly::MUL_I32_S:
+  case WebAssembly::MUL_I64:
+  case WebAssembly::MUL_I64_S:
+  // Division destroys pointer structure
+  case WebAssembly::DIV_S_I32:
+  case WebAssembly::DIV_S_I32_S:
+  case WebAssembly::DIV_U_I32:
+  case WebAssembly::DIV_U_I32_S:
+  case WebAssembly::DIV_S_I64:
+  case WebAssembly::DIV_S_I64_S:
+  case WebAssembly::DIV_U_I64:
+  case WebAssembly::DIV_U_I64_S:
+  // Remainder is not a pointer
+  case WebAssembly::REM_S_I32:
+  case WebAssembly::REM_S_I32_S:
+  case WebAssembly::REM_U_I32:
+  case WebAssembly::REM_U_I32_S:
+  case WebAssembly::REM_S_I64:
+  case WebAssembly::REM_S_I64_S:
+  case WebAssembly::REM_U_I64:
+  case WebAssembly::REM_U_I64_S:
+  // Shifts destroy pointer structure
+  case WebAssembly::SHL_I32:
+  case WebAssembly::SHL_I32_S:
+  case WebAssembly::SHL_I64:
+  case WebAssembly::SHL_I64_S:
+  case WebAssembly::SHR_S_I32:
+  case WebAssembly::SHR_S_I32_S:
+  case WebAssembly::SHR_U_I32:
+  case WebAssembly::SHR_U_I32_S:
+  case WebAssembly::SHR_S_I64:
+  case WebAssembly::SHR_S_I64_S:
+  case WebAssembly::SHR_U_I64:
+  case WebAssembly::SHR_U_I64_S:
+  // Rotations destroy pointer structure
+  case WebAssembly::ROTL_I32:
+  case WebAssembly::ROTL_I32_S:
+  case WebAssembly::ROTL_I64:
+  case WebAssembly::ROTL_I64_S:
+  case WebAssembly::ROTR_I32:
+  case WebAssembly::ROTR_I32_S:
+  case WebAssembly::ROTR_I64:
+  case WebAssembly::ROTR_I64_S:
+  // Bit counting produces small integers, not pointers
+  case WebAssembly::CLZ_I32:
+  case WebAssembly::CLZ_I32_S:
+  case WebAssembly::CLZ_I64:
+  case WebAssembly::CLZ_I64_S:
+  case WebAssembly::CTZ_I32:
+  case WebAssembly::CTZ_I32_S:
+  case WebAssembly::CTZ_I64:
+  case WebAssembly::CTZ_I64_S:
+  case WebAssembly::POPCNT_I32:
+  case WebAssembly::POPCNT_I32_S:
+  case WebAssembly::POPCNT_I64:
+  case WebAssembly::POPCNT_I64_S:
+  // XOR completely transforms the value; GC cannot trace XOR'd pointers
+  case WebAssembly::XOR_I32:
+  case WebAssembly::XOR_I32_S:
+  case WebAssembly::XOR_I64:
+  case WebAssembly::XOR_I64_S:
+  // Comparisons produce boolean (0 or 1), not pointers
+  case WebAssembly::EQ_I32:
+  case WebAssembly::EQ_I32_S:
+  case WebAssembly::EQ_I64:
+  case WebAssembly::EQ_I64_S:
+  case WebAssembly::NE_I32:
+  case WebAssembly::NE_I32_S:
+  case WebAssembly::NE_I64:
+  case WebAssembly::NE_I64_S:
+  case WebAssembly::LT_S_I32:
+  case WebAssembly::LT_S_I32_S:
+  case WebAssembly::LT_U_I32:
+  case WebAssembly::LT_U_I32_S:
+  case WebAssembly::LT_S_I64:
+  case WebAssembly::LT_S_I64_S:
+  case WebAssembly::LT_U_I64:
+  case WebAssembly::LT_U_I64_S:
+  case WebAssembly::GT_S_I32:
+  case WebAssembly::GT_S_I32_S:
+  case WebAssembly::GT_U_I32:
+  case WebAssembly::GT_U_I32_S:
+  case WebAssembly::GT_S_I64:
+  case WebAssembly::GT_S_I64_S:
+  case WebAssembly::GT_U_I64:
+  case WebAssembly::GT_U_I64_S:
+  case WebAssembly::LE_S_I32:
+  case WebAssembly::LE_S_I32_S:
+  case WebAssembly::LE_U_I32:
+  case WebAssembly::LE_U_I32_S:
+  case WebAssembly::LE_S_I64:
+  case WebAssembly::LE_S_I64_S:
+  case WebAssembly::LE_U_I64:
+  case WebAssembly::LE_U_I64_S:
+  case WebAssembly::GE_S_I32:
+  case WebAssembly::GE_S_I32_S:
+  case WebAssembly::GE_U_I32:
+  case WebAssembly::GE_U_I32_S:
+  case WebAssembly::GE_S_I64:
+  case WebAssembly::GE_S_I64_S:
+  case WebAssembly::GE_U_I64:
+  case WebAssembly::GE_U_I64_S:
+  case WebAssembly::EQZ_I32:
+  case WebAssembly::EQZ_I32_S:
+  case WebAssembly::EQZ_I64:
+  case WebAssembly::EQZ_I64_S:
     return true;
   default:
     return false;
@@ -169,8 +267,16 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   }
 
   // Phase 2: Propagate pointer-ness through dataflow.
-  // Instructions that can propagate a pointer value from an operand to their
-  // result: ADD/SUB (pointer arithmetic), SELECT, COPY, PHI.
+  // Use a blocklist approach: any I32/I64-producing instruction that has a
+  // potential pointer input will propagate pointer-ness to its result, UNLESS
+  // the instruction is on the blocklist of operations that definitely destroy
+  // pointer structure. This ensures safety: unknown instructions default to
+  // propagating, which may cause extra spills but won't miss real pointers.
+  //
+  // Propagated: ADD, SUB, AND (alignment), OR (tagging), SELECT, COPY, PHI,
+  //             WRAP, EXTEND, and any unlisted instruction.
+  // Blocked: MUL, DIV, REM, SHL, SHR, ROT, CLZ, CTZ, POPCNT, XOR,
+  //          comparisons (EQ, NE, LT, GT, LE, GE, EQZ).
   bool Propagated = true;
   while (Propagated) {
     Propagated = false;
@@ -192,9 +298,8 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
 
           unsigned Opc = MI.getOpcode();
 
-          // Only propagate through pointer-preserving instructions.
-          if (!isPointerArithmeticOpcode(Opc) && !isSelectOpcode(Opc) &&
-              !MI.isCopy() && !MI.isPHI())
+          // Skip instructions whose results are definitely not pointers.
+          if (isDefinitelyNotPointerResult(Opc))
             continue;
 
           // Check if any register use operand is a potential pointer.
