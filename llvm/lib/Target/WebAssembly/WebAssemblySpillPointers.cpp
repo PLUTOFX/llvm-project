@@ -245,9 +245,37 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
 
         unsigned Opc = MI.getOpcode();
 
-        // Call results could be pointers (e.g., malloc, GC_malloc).
+        // Call results: for direct calls, only treat as potential pointers if the
+        // callee's return type is a pointer (e.g., malloc, GC_malloc). For
+        // indirect calls, conservatively treat all I32/I64 results as pointers.
         if (MI.isCall()) {
-          PotentialPointers.insert(DefReg);
+          bool MayBePointer = true;
+          for (unsigned J = 0, JE = MI.getNumOperands(); J < JE; ++J) {
+            const MachineOperand &CalleeOp = MI.getOperand(J);
+            if (CalleeOp.isGlobal()) {
+              if (auto *Callee =
+                      dyn_cast<Function>(CalleeOp.getGlobal())) {
+                Type *RetTy = Callee->getReturnType();
+                // For multi-value returns (struct returns), check all elements
+                if (auto *STy = dyn_cast<StructType>(RetTy)) {
+                  // Find which element this def corresponds to
+                  // For simplicity, if any element is a pointer, mark as pointer
+                  MayBePointer = false;
+                  for (unsigned K = 0; K < STy->getNumElements(); ++K) {
+                    if (STy->getElementType(K)->isPointerTy()) {
+                      MayBePointer = true;
+                      break;
+                    }
+                  }
+                } else {
+                  MayBePointer = RetTy->isPointerTy();
+                }
+              }
+              break;
+            }
+          }
+          if (MayBePointer)
+            PotentialPointers.insert(DefReg);
           continue;
         }
 
@@ -257,9 +285,16 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           continue;
         }
 
-        // Function arguments could be pointers.
+        // Function arguments: only treat as potential pointers if the original
+        // LLVM IR parameter type is a pointer. Pure integer arguments (e.g.,
+        // sizes, offsets, flags) should not be treated as pointers.
         if (WebAssembly::isArgument(Opc)) {
-          PotentialPointers.insert(DefReg);
+          unsigned ArgIdx = MI.getOperand(1).getImm();
+          const Function &F = MF.getFunction();
+          if (ArgIdx < F.arg_size() &&
+              F.getArg(ArgIdx)->getType()->isPointerTy()) {
+            PotentialPointers.insert(DefReg);
+          }
           continue;
         }
       }
@@ -334,9 +369,18 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "  Found " << PointerRegs.size()
                     << " potential pointer registers\n");
 
-  // First pass: determine which potential pointer vregs are live at any call.
-  // Only allocate spill slots for those that actually need spilling to avoid
-  // creating unnecessary stack frame space.
+  // First pass: determine which potential pointer vregs are live across any
+  // call. Only allocate spill slots for those that actually need spilling to
+  // avoid creating unnecessary stack frame space.
+  //
+  // A register is live "across" a call if it is live both before AND after the
+  // call instruction:
+  //   - liveAt(CallIdx): the register was defined before the call and its value
+  //     exists at the call's base slot. This excludes call results (which are
+  //     defined by the call, so their live range starts at getRegSlot()).
+  //   - liveAt(CallIdx.getRegSlot()): the register is still live at the call's
+  //     def slot. This excludes values that are merely consumed as call
+  //     arguments (their live range ends at getRegSlot()).
   DenseSet<Register> NeedSpill;
   for (auto &MBB : MF) {
     for (auto &MI : MBB) {
@@ -348,7 +392,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           continue;
         if (LIS.hasInterval(Reg)) {
           auto &LI = LIS.getInterval(Reg);
-          if (LI.liveAt(CallIdx))
+          if (LI.liveAt(CallIdx) && LI.liveAt(CallIdx.getRegSlot()))
             NeedSpill.insert(Reg);
         }
       }
@@ -384,7 +428,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
 
       LLVM_DEBUG(dbgs() << "  Found call at: " << MI);
 
-      // Find which pointer registers are live at this call
+      // Find which pointer registers are live across this call
       SlotIndex CallIdx = LIS.getInstructionIndex(MI);
       SmallVector<Register, 8> LivePointers;
       for (Register Reg : PointerRegs) {
@@ -392,7 +436,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           continue;
         if (LIS.hasInterval(Reg)) {
           auto &LI = LIS.getInterval(Reg);
-          if (LI.liveAt(CallIdx))
+          if (LI.liveAt(CallIdx) && LI.liveAt(CallIdx.getRegSlot()))
             LivePointers.push_back(Reg);
         }
       }
