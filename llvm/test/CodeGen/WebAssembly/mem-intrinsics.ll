@@ -11,8 +11,9 @@ declare void @llvm.memset.p0.i32(ptr nocapture, i8, i32, i1)
 ; Test that return values are optimized.
 
 ; CHECK-LABEL: copy_yes:
-; CHECK:      call     $push0=, memcpy, $0, $1, $2{{$}}
-; CHECK-NEXT: return   $pop0{{$}}
+; CHECK:      i32.store {{.*}}, $0{{$}}
+; CHECK-NEXT: call     $drop=, memcpy, $0, $1, $2{{$}}
+; CHECK:      return   $0{{$}}
 define ptr @copy_yes(ptr %dst, ptr %src, i32 %len) {
   call void @llvm.memcpy.p0.p0.i32(ptr %dst, ptr %src, i32 %len, i1 false)
   ret ptr %dst
@@ -27,8 +28,9 @@ define void @copy_no(ptr %dst, ptr %src, i32 %len) {
 }
 
 ; CHECK-LABEL: move_yes:
-; CHECK:      call     $push0=, memmove, $0, $1, $2{{$}}
-; CHECK-NEXT: return   $pop0{{$}}
+; CHECK:      i32.store {{.*}}, $0{{$}}
+; CHECK-NEXT: call     $drop=, memmove, $0, $1, $2{{$}}
+; CHECK:      return   $0{{$}}
 define ptr @move_yes(ptr %dst, ptr %src, i32 %len) {
   call void @llvm.memmove.p0.p0.i32(ptr %dst, ptr %src, i32 %len, i1 false)
   ret ptr %dst
@@ -43,8 +45,9 @@ define void @move_no(ptr %dst, ptr %src, i32 %len) {
 }
 
 ; CHECK-LABEL: set_yes:
-; CHECK:      call     $push0=, memset, $0, $1, $2{{$}}
-; CHECK-NEXT: return   $pop0{{$}}
+; CHECK:      i32.store {{.*}}, $0{{$}}
+; CHECK-NEXT: call     $drop=, memset, $0, $1, $2{{$}}
+; CHECK:      return   $0{{$}}
 define ptr @set_yes(ptr %dst, i8 %src, i32 %len) {
   call void @llvm.memset.p0.i32(ptr %dst, i8 %src, i32 %len, i1 false)
   ret ptr %dst
@@ -110,7 +113,7 @@ bb11:
 ; result of the memset *is* stackified.
 
 ; CHECK-LABEL: tail_dup_to_reuse_result:
-; CHECK: call $push{{[0-9]+}}=, memset, $0, $1, $2
+; CHECK: call $drop=, memset, $0, $1, $2
 define ptr @tail_dup_to_reuse_result(ptr %arg, i8 %arg1, i32 %arg2, i32 %arg3, i32 %arg4) {
 bb:
   %tmp = icmp eq i32 %arg3, 0

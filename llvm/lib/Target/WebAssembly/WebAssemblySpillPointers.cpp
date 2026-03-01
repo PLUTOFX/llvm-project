@@ -212,7 +212,6 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   });
 
   const auto *TII = MF.getSubtarget<WebAssemblySubtarget>().getInstrInfo();
-  const auto *TRI = MF.getSubtarget<WebAssemblySubtarget>().getRegisterInfo();
   auto &MRI = MF.getRegInfo();
   auto &LIS = getAnalysis<LiveIntervals>();
   auto &MFI = MF.getFrameInfo();
@@ -415,7 +414,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
     int FI = MFI.CreateSpillStackObject(PtrSize, Align(PtrSize));
     SpillSlots[Reg] = FI;
     LLVM_DEBUG(dbgs() << "  Allocated frame slot " << FI << " for "
-                      << printReg(Reg, TRI) << "\n");
+                      << printReg(Reg) << "\n");
   }
 
   // Second pass: insert spill stores before each call
@@ -472,7 +471,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
             .addReg(Reg);         // value to store
 
         LLVM_DEBUG(dbgs() << "      Spilled "
-                          << printReg(Reg, TRI)
+                          << printReg(Reg)
                           << " to frame slot " << FI << "\n");
         Changed = true;
       }
