@@ -1,4 +1,4 @@
-; RUN: llc < %s -O2 -asm-verbose=false -wasm-keep-registers | FileCheck %s
+; RUN: llc < %s -O2 -asm-verbose=false -wasm-keep-registers -wasm-enable-spill-pointers | FileCheck %s
 
 ; Test that the SpillPointers pass only spills pointer-typed values to the
 ; shadow stack, not all I32/I64 values. This optimization is important for
