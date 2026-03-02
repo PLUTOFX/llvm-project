@@ -44,20 +44,7 @@ conservative garbage collectors like Boehm GC can find all live pointers by
 scanning linear memory. Without this pass, at -O2 and above, pointer values
 may only reside in wasm locals (registers) that are invisible to the GC.
 
-This pass is gated behind the -wasm-enable-spill-pointers flag (off by
-default) and only runs at optimization levels above -O0.
-
-Usage with clang:
-
-  clang --target=wasm32-wasi -O2 \
-    -mllvm -wasm-enable-spill-pointers \
-    example.c -o example.wasm
-
-Usage with llc:
-
-  llc -mtriple=wasm32-unknown-wasi -O2 \
-    -wasm-enable-spill-pointers \
-    example.ll -o example.s
+This pass is enabled by default at optimization levels above -O0.
 
 Some notes on ways that the generated code could be improved follow:
 
