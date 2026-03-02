@@ -36,6 +36,21 @@
 /// The pass runs after register allocation but before ExplicitLocals, so it
 /// can work with virtual registers and insert machine instructions.
 ///
+/// This pass is gated behind the -wasm-enable-spill-pointers flag (off by
+/// default) and only runs at optimization levels above -O0.
+///
+/// Usage with clang (pass LLVM backend flags via -mllvm):
+///
+///   clang --target=wasm32-wasi -O2 \
+///     -mllvm -wasm-enable-spill-pointers \
+///     -c example.c -o example.o
+///
+/// Usage with llc directly:
+///
+///   llc -mtriple=wasm32-unknown-wasi -O2 \
+///     -wasm-enable-spill-pointers \
+///     example.ll -o example.s
+///
 //===----------------------------------------------------------------------===//
 
 #include "WebAssembly.h"
