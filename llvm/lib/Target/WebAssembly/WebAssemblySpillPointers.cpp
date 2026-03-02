@@ -211,6 +211,13 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
            << "********** Function: " << MF.getName() << '\n';
   });
 
+  // Only spill pointers for functions that use a GC strategy. Functions without
+  // GC support do not need shadow stack spilling for collector visibility.
+  if (!MF.getFunction().hasGC()) {
+    LLVM_DEBUG(dbgs() << "  Function has no GC strategy, skipping\n");
+    return false;
+  }
+
   const auto *TII = MF.getSubtarget<WebAssemblySubtarget>().getInstrInfo();
   auto &MRI = MF.getRegInfo();
   auto &LIS = getAnalysis<LiveIntervals>();
