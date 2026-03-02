@@ -77,28 +77,27 @@ define void @allocarray() {
 
 ; CHECK-LABEL: non_mem_use
 define void @non_mem_use(ptr %addr) {
- ; CHECK: i[[PTR]].const $push[[L2:.+]]=, 48
+ ; CHECK: i[[PTR]].const $push[[L2:.+]]=, 64
  ; CHECK-NEXT: i[[PTR]].sub $push[[L12:.+]]=, {{.+}}, $pop[[L2]]
  ; CHECK-NEXT: local.tee $push[[L11:.+]]=, [[SP:.+]], $pop[[L12]]
  ; CHECK-NEXT: global.set __stack_pointer, $pop[[L11]]
  %buf = alloca [27 x i8], align 16
  %r = alloca i64
  %r2 = alloca i64
- ; %r is at SP+8
- ; CHECK: local.get $push[[L3:.+]]=, [[SP]]
- ; CHECK: i[[PTR]].const $push[[OFF:.+]]=, 8
- ; CHECK-NEXT: i[[PTR]].add $push[[ARG1:.+]]=, $pop[[L3]], $pop[[OFF]]
+ ; %r is at SP+24
+ ; CHECK: i[[PTR]].const $push[[OFF:.+]]=, 24
+ ; CHECK-NEXT: i[[PTR]].add $push[[ARG1:.+]]=, $pop{{.+}}, $pop[[OFF]]
  ; CHECK-NEXT: call ext_func, $pop[[ARG1]]
  call void @ext_func(ptr %r)
- ; %r2 is at SP+0, no add needed
- ; CHECK: local.get $push[[L4:.+]]=, [[SP]]
- ; CHECK-NEXT: call ext_func, $pop[[L4]]
+ ; %r2 is at SP+16
+ ; CHECK: i[[PTR]].const $push[[OFF2:.+]]=, 16
+ ; CHECK-NEXT: i[[PTR]].add $push[[ARG2:.+]]=, $pop{{.+}}, $pop[[OFF2]]
+ ; CHECK-NEXT: call ext_func, $pop[[ARG2]]
  call void @ext_func(ptr %r2)
  ; Use as a value, but in a store
- ; %buf is at SP+16
- ; CHECK: local.get $push[[L5:.+]]=, [[SP]]
- ; CHECK: i[[PTR]].const $push[[OFF:.+]]=, 16
- ; CHECK-NEXT: i[[PTR]].add $push[[VAL:.+]]=, $pop[[L5]], $pop[[OFF]]
+ ; %buf is at SP+32
+ ; CHECK: i[[PTR]].const $push[[OFF3:.+]]=, 32
+ ; CHECK-NEXT: i[[PTR]].add $push[[VAL:.+]]=, $pop{{.+}}, $pop[[OFF3]]
  ; CHECK-NEXT: i[[PTR]].store 0($pop{{.+}}), $pop[[VAL]]
  store ptr %buf, ptr %addr
  ret void

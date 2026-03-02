@@ -34,6 +34,18 @@ encoding of WebAssembly itself:
   * https://github.com/WebAssembly/design/blob/main/Semantics.md
   * https://github.com/WebAssembly/design/blob/main/BinaryEncoding.md
 
+//===---------------------------------------------------------------------===//
+
+Conservative GC Support (Pointer Spilling)
+
+The WebAssemblySpillPointers pass spills pointer-typed virtual registers to
+the shadow stack (linear memory) before function calls, ensuring that
+conservative garbage collectors like Boehm GC can find all live pointers by
+scanning linear memory. Without this pass, at -O2 and above, pointer values
+may only reside in wasm locals (registers) that are invisible to the GC.
+
+This pass is enabled by default at optimization levels above -O0.
+
 Some notes on ways that the generated code could be improved follow:
 
 //===---------------------------------------------------------------------===//

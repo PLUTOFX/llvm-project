@@ -36,6 +36,8 @@
 /// The pass runs after register allocation but before ExplicitLocals, so it
 /// can work with virtual registers and insert machine instructions.
 ///
+/// This pass is enabled by default at optimization levels above -O0.
+///
 //===----------------------------------------------------------------------===//
 
 #include "WebAssembly.h"

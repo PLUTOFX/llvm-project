@@ -47,12 +47,6 @@ static cl::opt<bool> WasmDisableExplicitLocals(
              " instruction output for test purposes only."),
     cl::init(false));
 
-//static cl::opt<bool> WasmEnableSpillPointers(
-//    "wasm-enable-spill-pointers", cl::Hidden,
-//    cl::desc("WebAssembly: spill pointer-typed values to shadow stack "
-//             "before calls for conservative GC support."),
-//    cl::init(false));
-
 extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeWebAssemblyTarget() {
   // Register the target.
   RegisterTargetMachine<WebAssemblyTargetMachine> X(
@@ -533,8 +527,7 @@ void WebAssemblyPassConfig::addPostRegAlloc() {
 
   // Spill pointer-typed values to shadow stack for GC.
   // This must run before PEI so that frame indices are properly resolved.
-//  if (WasmEnableSpillPointers && getOptLevel() != CodeGenOpt::None)
-    if (getOptLevel() != CodeGenOpt::None)
+  if (getOptLevel() != CodeGenOpt::None)
     addPass(createWebAssemblySpillPointers());
 
   TargetPassConfig::addPostRegAlloc();
