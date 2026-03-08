@@ -534,8 +534,7 @@ void WebAssemblyPassConfig::addPostRegAlloc() {
   // Spill pointer-typed values to shadow stack for GC.
   // This must run before PEI so that frame indices are properly resolved.
 //  if (WasmEnableSpillPointers && getOptLevel() != CodeGenOpt::None)
-    if (getOptLevel() != CodeGenOpt::None)
-    addPass(createWebAssemblySpillPointers());
+  addPass(createWebAssemblySpillPointers());
 
   TargetPassConfig::addPostRegAlloc();
 }
