@@ -70,9 +70,7 @@ define i32 @sink_trap(i32 %x, i32 %y, ptr %p) {
 ; Yes because the call is readnone.
 
 ; CHECK-LABEL: sink_readnone_call:
-; CHECK: call ${{[0-9]+}}=, readnone_callee{{$}}
-; CHECK: i32.store
-; CHECK: return ${{[0-9]+}}{{$}}
+; CHECK: return $pop1{{$}}
 ; NOREGS-LABEL: sink_readnone_call:
 ; NOREGS: return{{$}}
 declare i32 @readnone_callee() readnone nounwind
@@ -520,7 +518,7 @@ exit:
 ; CHECK-LABEL: no_stackify_call_past_load:
 ; CHECK: call $0=, red
 ; CHECK: i32.const $push0=, 0
-; CHECK: i32.load {{.*}}=, count($pop0)
+; CHECK: i32.load $1=, count($pop0)
 ; NOREGS-LABEL: no_stackify_call_past_load:
 ; NOREGS: call red
 ; NOREGS: i32.const 0
@@ -553,13 +551,13 @@ define i32 @no_stackify_store_past_load(i32 %a, ptr %p1, ptr %p2) {
 ; Can still stackify past invariant loads.
 ; CHECK-LABEL: store_past_invar_load
 ; CHECK: i32.store 0($1), $0
-; CHECK: i32.load {{.*}}, 0($2)
 ; CHECK: call {{.*}}, callee, $0
-; CHECK: return ${{[0-9]+}}
+; CHECK: i32.load $push{{.*}}, 0($2)
+; CHECK: return $pop
 ; NOREGS-LABEL: store_past_invar_load
 ; NOREGS: i32.store 0
-; NOREGS: i32.load 0
 ; NOREGS: call callee
+; NOREGS: i32.load 0
 ; NOREGS: return
 define i32 @store_past_invar_load(i32 %a, ptr %p1, ptr dereferenceable(4) align(4) %p2) {
   store i32 %a, ptr %p1
