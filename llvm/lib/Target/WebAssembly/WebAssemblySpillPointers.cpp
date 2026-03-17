@@ -52,6 +52,7 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LowLevelTypeImpl.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
@@ -59,6 +60,75 @@ using namespace llvm;
 #define DEBUG_TYPE "wasm-spill-pointers"
 
 namespace {
+
+/// Returns true if a call instruction is known to be safe for GC purposes,
+/// meaning it cannot trigger a garbage collection and therefore does not
+/// require pointer spills. This includes:
+/// - readnone nounwind calls: they don't access memory at all, so GC cannot
+///   be triggered
+/// - Known safe library intrinsics: memcpy, memmove, memset only copy/set
+///   memory and do not allocate, so they cannot trigger GC
+static bool isCallSafeForGC(const MachineInstr &MI) {
+  assert(MI.isCall());
+
+  for (unsigned I = 0, E = MI.getNumOperands(); I < E; ++I) {
+    const MachineOperand &MO = MI.getOperand(I);
+
+    if (MO.isGlobal()) {
+      if (auto *Callee = dyn_cast<Function>(MO.getGlobal())) {
+        // readnone nounwind functions don't access memory and can't throw,
+        // so they can never trigger GC.
+        if (Callee->doesNotAccessMemory() && Callee->doesNotThrow())
+          return true;
+
+        // Known-safe library functions that only read/write memory but never
+        // allocate, and therefore cannot trigger GC.
+        StringRef Name = Callee->getName();
+        if (Name == "memcpy" || Name == "memmove" || Name == "memset")
+          return true;
+      }
+      break;
+    }
+
+    // memcpy/memmove/memset are often lowered as external symbol calls
+    // (MO_ExternalSymbol) rather than global address calls.
+    if (MO.isSymbol()) {
+      StringRef Name = MO.getSymbolName();
+      if (Name == "memcpy" || Name == "memmove" || Name == "memset")
+        return true;
+      break;
+    }
+  }
+
+  return false;
+}
+
+/// Returns true if a load instruction is loading a value that could be a
+/// pointer. We check the MachineMemOperand's type info to distinguish pointer
+/// loads from non-pointer loads. If the loaded memory type is a pointer type
+/// (LLT::isPointer()), the result may be a pointer. If it's a plain scalar
+/// (e.g., s32 for i32), it's definitely not a pointer. If we cannot determine
+/// the type, we conservatively assume it could be a pointer.
+static bool isLoadOfPotentialPointer(const MachineInstr &MI, bool Is64Bit) {
+  assert(MI.mayLoad());
+
+  // Check MachineMemOperand type info
+  for (auto *MMO : MI.memoperands()) {
+    LLT MemType = MMO->getType();
+    if (MemType.isValid()) {
+      // LLT preserves pointer vs scalar distinction from LLVM IR.
+      // If the memory type is a pointer, the loaded value could be a pointer.
+      // If it's a scalar (e.g., s32 for `load i32`), it's not a pointer.
+      if (MemType.isPointer())
+        return true;
+      if (MemType.isScalar())
+        return false;
+    }
+  }
+
+  // If no memory operand info available, conservatively assume pointer.
+  return true;
+}
 
 /// Returns true if an instruction's I32/I64 result is definitely not a pointer,
 /// even if some of its inputs are pointers. This blocklist approach means any
@@ -280,9 +350,12 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           continue;
         }
 
-        // Values loaded from memory could be pointers (LOAD, GLOBAL_GET, etc.)
+        // Values loaded from memory could be pointers, but only if the loaded
+        // type is a pointer type. Loading a plain i32 (e.g., `load i32, ptr @count`)
+        // should not be treated as a pointer.
         if (MI.mayLoad()) {
-          PotentialPointers.insert(DefReg);
+          if (isLoadOfPotentialPointer(MI, Is64Bit))
+            PotentialPointers.insert(DefReg);
           continue;
         }
 
@@ -338,6 +411,20 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           if (isDefinitelyNotPointerResult(Opc))
             continue;
 
+          // Skip loads: a load takes a pointer address as input but produces
+          // the loaded value, which is NOT necessarily a pointer. Loads are
+          // already handled in Phase 1 with proper type checking via
+          // isLoadOfPotentialPointer(). We must not propagate pointer-ness
+          // from the address operand to the loaded result here.
+          if (MI.mayLoad())
+            continue;
+
+          // Similarly, skip calls: call results are already classified in
+          // Phase 1 based on the callee's return type. We must not propagate
+          // pointer-ness from call arguments to the call result.
+          if (MI.isCall())
+            continue;
+
           // Check if any register use operand is a potential pointer.
           for (unsigned J = 0, JE = MI.getNumOperands(); J < JE; ++J) {
             const MachineOperand &UseOp = MI.getOperand(J);
@@ -387,6 +474,9 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
     for (auto &MI : MBB) {
       if (!MI.isCall())
         continue;
+      // Skip calls that are known to be safe for GC (can't trigger collection)
+      if (isCallSafeForGC(MI))
+        continue;
       SlotIndex CallIdx = LIS.getInstructionIndex(MI);
       for (Register Reg : PointerRegs) {
         if (NeedSpill.count(Reg))
@@ -425,6 +515,10 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
       MachineInstr &MI = *MII;
 
       if (!MI.isCall())
+        continue;
+
+      // Skip calls that are known to be safe for GC (can't trigger collection)
+      if (isCallSafeForGC(MI))
         continue;
 
       LLVM_DEBUG(dbgs() << "  Found call at: " << MI);
