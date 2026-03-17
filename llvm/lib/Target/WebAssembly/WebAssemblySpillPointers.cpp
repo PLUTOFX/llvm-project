@@ -64,10 +64,24 @@ namespace {
 /// Returns true if a call instruction is known to be safe for GC purposes,
 /// meaning it cannot trigger a garbage collection and therefore does not
 /// require pointer spills. This includes:
-/// - readnone nounwind calls: they don't access memory at all, so GC cannot
-///   be triggered
-/// - Known safe library intrinsics: memcpy, memmove, memset only copy/set
-///   memory and do not allocate, so they cannot trigger GC
+///
+/// - **readnone nounwind calls**: In LLVM IR, function attributes describe
+///   a function's behavior. `readnone` (also called `doesNotAccessMemory`)
+///   means the function does not read from or write to any memory -- it is a
+///   pure computation (e.g., a math function like sin/cos, or a simple
+///   integer computation). `nounwind` (also called `doesNotThrow`) means the
+///   function will never throw an exception or invoke an unwinder. A function
+///   with BOTH attributes cannot possibly trigger garbage collection, because
+///   GC requires either memory allocation (which involves writing memory) or
+///   a safepoint mechanism (which involves throwing/unwinding). Therefore,
+///   pointer values that are live across such calls do not need to be spilled
+///   to the shadow stack.
+///   Example from test: `declare i32 @readnone_callee() readnone nounwind`
+///
+/// - **Known safe library intrinsics**: memcpy, memmove, memset only copy or
+///   set existing memory and do not allocate new memory, so they cannot
+///   trigger GC. These are frequently emitted by LLVM as external symbol
+///   calls (MO_ExternalSymbol) rather than global function references.
 static bool isCallSafeForGC(const MachineInstr &MI) {
   assert(MI.isCall());
 
@@ -76,8 +90,10 @@ static bool isCallSafeForGC(const MachineInstr &MI) {
 
     if (MO.isGlobal()) {
       if (auto *Callee = dyn_cast<Function>(MO.getGlobal())) {
-        // readnone nounwind functions don't access memory and can't throw,
-        // so they can never trigger GC.
+        // doesNotAccessMemory() checks for the `readnone` attribute.
+        // doesNotThrow() checks for the `nounwind` attribute.
+        // Together they guarantee the call is a pure computation that cannot
+        // trigger GC. Example: `declare i32 @readnone_callee() readnone nounwind`
         if (Callee->doesNotAccessMemory() && Callee->doesNotThrow())
           return true;
 
@@ -105,10 +121,36 @@ static bool isCallSafeForGC(const MachineInstr &MI) {
 
 /// Returns true if a load instruction is loading a value that could be a
 /// pointer. We check the MachineMemOperand's type info to distinguish pointer
-/// loads from non-pointer loads. If the loaded memory type is a pointer type
-/// (LLT::isPointer()), the result may be a pointer. If it's a plain scalar
-/// (e.g., s32 for i32), it's definitely not a pointer. If we cannot determine
-/// the type, we conservatively assume it could be a pointer.
+/// loads from non-pointer loads.
+///
+/// **What is LLT (Low Level Type)?**
+/// LLVM uses LLT to represent types at the machine instruction level. Unlike
+/// LLVM IR types (i32, i64, ptr, float, etc.), LLT is a simplified type system
+/// used after instruction selection. The key types relevant here are:
+///
+/// - `s32` (scalar 32-bit): Represents a plain 32-bit integer value. This is
+///   what you get from `load i32, ptr %p` in LLVM IR. The "s" stands for
+///   "scalar" and "32" is the bit width. Similarly, `s64` is a 64-bit integer.
+///
+/// - `p0` (pointer in address space 0): Represents a pointer value. This is
+///   what you get from `load ptr, ptr %p` in LLVM IR. The "p" stands for
+///   "pointer" and "0" is the address space number.
+///
+/// **Why does this distinction matter?**
+/// In WebAssembly, both pointers and integers are represented as i32 (or i64
+/// on wasm64). At the machine instruction level, `load i32` and `load ptr`
+/// both produce an I32 register. However, the MachineMemOperand attached to
+/// the load instruction preserves the original type from LLVM IR:
+///   - `load i32, ptr @count` → MachineMemOperand type = `s32` (NOT a pointer)
+///   - `load ptr, ptr @table`  → MachineMemOperand type = `p0` (IS a pointer)
+///
+/// By checking MMO->getType().isPointer() vs isScalar(), we can avoid
+/// unnecessarily treating integer loads as pointer values, which would cause
+/// false-positive spills.
+///
+/// If we cannot determine the type (no MachineMemOperand available), we
+/// conservatively assume the loaded value could be a pointer to ensure GC
+/// safety.
 static bool isLoadOfPotentialPointer(const MachineInstr &MI, bool Is64Bit) {
   assert(MI.mayLoad());
 
