@@ -453,20 +453,6 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           if (isDefinitelyNotPointerResult(Opc))
             continue;
 
-          // Skip loads: a load takes a pointer address as input but produces
-          // the loaded value, which is NOT necessarily a pointer. Loads are
-          // already handled in Phase 1 with proper type checking via
-          // isLoadOfPotentialPointer(). We must not propagate pointer-ness
-          // from the address operand to the loaded result here.
-          if (MI.mayLoad())
-            continue;
-
-          // Similarly, skip calls: call results are already classified in
-          // Phase 1 based on the callee's return type. We must not propagate
-          // pointer-ness from call arguments to the call result.
-          if (MI.isCall())
-            continue;
-
           // Check if any register use operand is a potential pointer.
           for (unsigned J = 0, JE = MI.getNumOperands(); J < JE; ++J) {
             const MachineOperand &UseOp = MI.getOperand(J);

@@ -548,16 +548,19 @@ define i32 @no_stackify_store_past_load(i32 %a, ptr %p1, ptr %p2) {
   ret i32 %b
 }
 
-; Can still stackify past invariant loads.
+; SpillPointers conservatively spills the loaded value (since the address
+; operand is a pointer, Phase 2 propagation marks the result as potentially a
+; pointer). This prevents sinking the invariant load past the call, but is the
+; correct trade-off for GC safety.
 ; CHECK-LABEL: store_past_invar_load
 ; CHECK: i32.store 0($1), $0
+; CHECK: i32.load {{.*}}, 0($2)
 ; CHECK: call {{.*}}, callee, $0
-; CHECK: i32.load $push{{.*}}, 0($2)
-; CHECK: return $pop
+; CHECK: return
 ; NOREGS-LABEL: store_past_invar_load
 ; NOREGS: i32.store 0
-; NOREGS: call callee
 ; NOREGS: i32.load 0
+; NOREGS: call callee
 ; NOREGS: return
 define i32 @store_past_invar_load(i32 %a, ptr %p1, ptr dereferenceable(4) align(4) %p2) {
   store i32 %a, ptr %p1
