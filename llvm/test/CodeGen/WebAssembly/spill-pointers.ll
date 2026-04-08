@@ -1,8 +1,10 @@
 ; RUN: llc < %s -O2 -asm-verbose=false -wasm-keep-registers | FileCheck %s
 
-; Test that the SpillPointers pass only spills pointer-typed values to the
-; shadow stack, not all I32/I64 values. This optimization is important for
-; conservative GCs like Boehm GC which scan the shadow stack for live pointers.
+; Test that the SpillPointers pass spills all potential pointer values that are
+; live at any call site (including values used only as call arguments) to the
+; shadow stack. Conservative GCs like Boehm GC scan the shadow stack during
+; calls, so every potential pointer that is alive when a call executes must be
+; visible there.
 
 target triple = "wasm32-unknown-unknown"
 
@@ -58,7 +60,9 @@ entry:
 }
 
 ; Test: integer-only function should NOT generate shadow stack frame or spills.
-; No potential pointer values are live across any calls, so no frame is needed.
+; Although all i32/i64 arguments are treated as potential pointer seeds, %a and
+; %b are dead before the call to use_int (last used in the add/mul sequence),
+; so no potential pointer is live at the call site and NeedSpill is empty.
 ;
 ; CHECK-LABEL: test_int_only:
 ; CHECK-NOT: __stack_pointer
@@ -111,4 +115,23 @@ entry:
   %q = inttoptr i32 %tagged to ptr
   call void @GC_gcollect()
   ret ptr %q
+}
+
+; Test: a pointer that is only used as a call argument (consumed by the call,
+; not needed after it returns) must still be spilled before the call.
+; During the call, GC may run and needs to find this pointer in the shadow
+; stack to keep the referenced object alive. Interior pointers derived from GC
+; heap objects (e.g., vtable+offset) commonly exhibit this pattern.
+;
+; CHECK-LABEL: test_ptr_consumed_by_call:
+; CHECK: call {{.*}}GC_malloc
+; CHECK: i32.store
+; CHECK: call {{.*}}use_ptr
+define void @test_ptr_consumed_by_call() {
+entry:
+  %ptr = call ptr @GC_malloc(i32 8)
+  ; %ptr is only used as an argument to use_ptr and is not needed after.
+  ; It must still be spilled so GC can find the object during the call.
+  call void @use_ptr(ptr %ptr)
+  ret void
 }

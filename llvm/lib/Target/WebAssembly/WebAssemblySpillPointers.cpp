@@ -13,25 +13,37 @@
 /// find all live pointers.
 ///
 /// Similar to binaryen's SpillPointers pass, this ensures GC correctness by
-/// making sure all pointer values that are live across calls are visible in
+/// making sure all pointer values that are live at any call site are visible in
 /// linear memory where the GC can find them.
 ///
 /// Instead of conservatively spilling all I32/I64 registers, this pass performs
 /// a dataflow analysis to identify which virtual registers actually hold
 /// potential pointer values. Seed pointers are identified from call results,
-/// memory loads, function arguments, and global gets. Pointer-ness is then
-/// propagated through a blocklist approach: any I32/I64-producing instruction
-/// whose input includes a potential pointer will propagate pointer-ness to its
-/// result, UNLESS the instruction is on a blocklist of operations that
-/// definitely destroy pointer structure. This blocklist includes MUL, DIV, REM,
-/// SHL, SHR, ROT, CLZ, CTZ, POPCNT, XOR, and comparisons. Operations like
-/// ADD, SUB, AND, OR, SELECT, COPY, PHI, and type conversions (WRAP, EXTEND)
-/// propagate pointer-ness because they can preserve recognizable pointer values
-/// (e.g., AND for alignment, OR for tagging, ADD/SUB for GEP offsets).
+/// memory loads, function arguments (all i32/i64 args are treated as potential
+/// pointers, since values like JSValue are tagged pointers stored as integers),
+/// and global gets. Pointer-ness is then propagated through a blocklist
+/// approach: any I32/I64-producing instruction whose input includes a potential
+/// pointer will propagate pointer-ness to its result, UNLESS the instruction is
+/// on a blocklist of operations that definitely destroy pointer structure. This
+/// blocklist includes MUL, DIV, REM, SHL, SHR, ROT, CLZ, CTZ, POPCNT, XOR,
+/// and comparisons. Operations like ADD, SUB, AND, OR, SELECT, COPY, PHI, and
+/// type conversions (WRAP, EXTEND) propagate pointer-ness because they can
+/// preserve recognizable pointer values (e.g., AND for alignment, OR for
+/// tagging, ADD/SUB for GEP offsets, yielding interior pointers).
 ///
 /// The blocklist approach is safer than an allowlist for conservative GC: any
 /// unknown or newly-added instruction defaults to propagating pointer-ness,
 /// which may cause some unnecessary spills but will never miss a real pointer.
+///
+/// IMPORTANT: A register is spilled if it is live AT any call site (not just
+/// live after the call returns). This is required for correctness with
+/// conservative GC: if a potential pointer is used only as a call argument, it
+/// may be an interior pointer to a GC-managed object (e.g., vtable+20 derived
+/// from a vtable). During the call, GC can trigger, and if this interior pointer
+/// is absent from the shadow stack, GC may not find the underlying object and
+/// incorrectly collect it. By spilling all live potential pointers — including
+/// those that are only call arguments — we ensure GC can always trace the full
+/// object graph.
 ///
 /// The pass runs after register allocation but before ExplicitLocals, so it
 /// can work with virtual registers and insert machine instructions.
@@ -401,16 +413,13 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           continue;
         }
 
-        // Function arguments: only treat as potential pointers if the original
-        // LLVM IR parameter type is a pointer. Pure integer arguments (e.g.,
-        // sizes, offsets, flags) should not be treated as pointers.
+        // Function arguments: conservatively treat all i32/i64 arguments as
+        // potential pointers. Some pointer values are passed as integer types
+        // in C code (e.g., JSValue in QuickJS is a tagged pointer stored as
+        // i32/i64). Limiting this to pointer-typed LLVM IR arguments would
+        // miss such cases and could cause GC to collect live objects.
         if (WebAssembly::isArgument(Opc)) {
-          unsigned ArgIdx = MI.getOperand(1).getImm();
-          const Function &F = MF.getFunction();
-          if (ArgIdx < F.arg_size() &&
-              F.getArg(ArgIdx)->getType()->isPointerTy()) {
-            PotentialPointers.insert(DefReg);
-          }
+          PotentialPointers.insert(DefReg);
           continue;
         }
       }
@@ -499,18 +508,23 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "  Found " << PointerRegs.size()
                     << " potential pointer registers\n");
 
-  // First pass: determine which potential pointer vregs are live across any
-  // call. Only allocate spill slots for those that actually need spilling to
-  // avoid creating unnecessary stack frame space.
+  // First pass: determine which potential pointer vregs are live at any
+  // call site. Allocate spill slots only for those that actually need spilling.
   //
-  // A register is live "across" a call if it is live both before AND after the
-  // call instruction:
+  // A register needs spilling if it is live at a call's base slot:
   //   - liveAt(CallIdx): the register was defined before the call and its value
-  //     exists at the call's base slot. This excludes call results (which are
-  //     defined by the call, so their live range starts at getRegSlot()).
-  //   - liveAt(CallIdx.getRegSlot()): the register is still live at the call's
-  //     def slot. This excludes values that are merely consumed as call
-  //     arguments (their live range ends at getRegSlot()).
+  //     exists at the call's base slot. This correctly excludes call results
+  //     (which are defined by the call, so their live range starts at
+  //     getRegSlot(), after the base slot).
+  //
+  // We intentionally do NOT also require liveAt(CallIdx.getRegSlot()). The
+  // stronger condition would skip registers that are only used as call
+  // arguments (live range ends at getRegSlot()). But for conservative GC
+  // correctness we must spill those too: a potential pointer consumed as a
+  // call argument may be an interior pointer to a GC-managed object (e.g.,
+  // vtable+20 derived from a GC heap vtable). If it is absent from the shadow
+  // stack during the call, GC can collect the underlying object even though the
+  // caller still needs it.
   DenseSet<Register> NeedSpill;
   for (auto &MBB : MF) {
     for (auto &MI : MBB) {
@@ -525,7 +539,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           continue;
         if (LIS.hasInterval(Reg)) {
           auto &LI = LIS.getInterval(Reg);
-          if (LI.liveAt(CallIdx) && LI.liveAt(CallIdx.getRegSlot()))
+          if (LI.liveAt(CallIdx))
             NeedSpill.insert(Reg);
         }
       }
@@ -533,7 +547,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   }
 
   if (NeedSpill.empty()) {
-    LLVM_DEBUG(dbgs() << "  No pointers live across calls, skipping\n");
+    LLVM_DEBUG(dbgs() << "  No pointers live at any call site, skipping\n");
     return false;
   }
 
@@ -565,7 +579,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
 
       LLVM_DEBUG(dbgs() << "  Found call at: " << MI);
 
-      // Find which pointer registers are live across this call
+      // Find which pointer registers are live at this call site
       SlotIndex CallIdx = LIS.getInstructionIndex(MI);
       SmallVector<Register, 8> LivePointers;
       for (Register Reg : PointerRegs) {
@@ -573,7 +587,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           continue;
         if (LIS.hasInterval(Reg)) {
           auto &LI = LIS.getInterval(Reg);
-          if (LI.liveAt(CallIdx) && LI.liveAt(CallIdx.getRegSlot()))
+          if (LI.liveAt(CallIdx))
             LivePointers.push_back(Reg);
         }
       }
