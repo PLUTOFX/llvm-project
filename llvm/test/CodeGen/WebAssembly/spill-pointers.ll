@@ -116,9 +116,9 @@ entry:
 ; Test: ptrtoint type information loss through global store/load.
 ; When a pointer is ptrtoint'd to integer and stored to a global, loading it
 ; back loses the pointer type info (load produces s32, not p0). The pass should
-; still identify the loaded value as a potential pointer because the load's
-; address (CONST_I32 @g_ptr_storage) is a pointer seed, and Phase 2 propagation
-; through loads marks the result as a potential pointer.
+; still identify the loaded value as a potential pointer because pointer-sized
+; scalar loads (s32 on wasm32) are conservatively treated as potential pointers
+; in the seed identification phase of the SpillPointers dataflow analysis.
 ; Use volatile to prevent the optimizer from eliminating the store/load roundtrip.
 ;
 ; CHECK-LABEL: test_ptrtoint_global_roundtrip:
