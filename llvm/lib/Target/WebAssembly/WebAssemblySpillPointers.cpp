@@ -82,42 +82,42 @@ namespace {
 ///   set existing memory and do not allocate new memory, so they cannot
 ///   trigger GC. These are frequently emitted by LLVM as external symbol
 ///   calls (MO_ExternalSymbol) rather than global function references.
-static bool isCallSafeForGC(const MachineInstr &MI) {
-  assert(MI.isCall());
+// static bool isCallSafeForGC(const MachineInstr &MI) {
+//   assert(MI.isCall());
 
-  for (unsigned I = 0, E = MI.getNumOperands(); I < E; ++I) {
-    const MachineOperand &MO = MI.getOperand(I);
+//   for (unsigned I = 0, E = MI.getNumOperands(); I < E; ++I) {
+//     const MachineOperand &MO = MI.getOperand(I);
 
-    if (MO.isGlobal()) {
-      if (auto *Callee = dyn_cast<Function>(MO.getGlobal())) {
-        // doesNotAccessMemory() checks for the `readnone` attribute.
-        // doesNotThrow() checks for the `nounwind` attribute.
-        // Together they guarantee the call is a pure computation that cannot
-        // trigger GC. Example: `declare i32 @readnone_callee() readnone nounwind`
-        if (Callee->doesNotAccessMemory() && Callee->doesNotThrow())
-          return true;
+//     if (MO.isGlobal()) {
+//       if (auto *Callee = dyn_cast<Function>(MO.getGlobal())) {
+//         // doesNotAccessMemory() checks for the `readnone` attribute.
+//         // doesNotThrow() checks for the `nounwind` attribute.
+//         // Together they guarantee the call is a pure computation that cannot
+//         // trigger GC. Example: `declare i32 @readnone_callee() readnone nounwind`
+//         if (Callee->doesNotAccessMemory() && Callee->doesNotThrow())
+//           return true;
 
-        // Known-safe library functions that only read/write memory but never
-        // allocate, and therefore cannot trigger GC.
-        StringRef Name = Callee->getName();
-        if (Name == "memcpy" || Name == "memmove" || Name == "memset")
-          return true;
-      }
-      break;
-    }
+//         // Known-safe library functions that only read/write memory but never
+//         // allocate, and therefore cannot trigger GC.
+//         StringRef Name = Callee->getName();
+//         if (Name == "memcpy" || Name == "memmove" || Name == "memset")
+//           return true;
+//       }
+//       break;
+//     }
 
-    // memcpy/memmove/memset are often lowered as external symbol calls
-    // (MO_ExternalSymbol) rather than global address calls.
-    if (MO.isSymbol()) {
-      StringRef Name = MO.getSymbolName();
-      if (Name == "memcpy" || Name == "memmove" || Name == "memset")
-        return true;
-      break;
-    }
-  }
+//     // memcpy/memmove/memset are often lowered as external symbol calls
+//     // (MO_ExternalSymbol) rather than global address calls.
+//     if (MO.isSymbol()) {
+//       StringRef Name = MO.getSymbolName();
+//       if (Name == "memcpy" || Name == "memmove" || Name == "memset")
+//         return true;
+//       break;
+//     }
+//   }
 
-  return false;
-}
+//   return false;
+// }
 
 /// Returns true if a load instruction is loading a value that could be a
 /// pointer. We check the MachineMemOperand's type info to distinguish pointer
@@ -369,17 +369,20 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
               if (auto *Callee =
                       dyn_cast<Function>(CalleeOp.getGlobal())) {
                 Type *RetTy = Callee->getReturnType();
-                // For multi-value returns (struct returns), check all elements
+                // For multi-value returns (struct returns), find the def index
+                // of the current operand and check only its corresponding element.
                 if (auto *STy = dyn_cast<StructType>(RetTy)) {
-                  // Find which element this def corresponds to
-                  // For simplicity, if any element is a pointer, mark as pointer
-                  MayBePointer = false;
-                  for (unsigned K = 0; K < STy->getNumElements(); ++K) {
-                    if (STy->getElementType(K)->isPointerTy()) {
-                      MayBePointer = true;
-                      break;
-                    }
+                  // Count which def index this operand is among all defs
+                  unsigned DefIdx = 0;
+                  for (unsigned K = 0; K < I; ++K) {
+                    const MachineOperand &PrevOp = MI.getOperand(K);
+                    if (PrevOp.isReg() && PrevOp.isDef())
+                      ++DefIdx;
                   }
+                  if (DefIdx < STy->getNumElements())
+                    MayBePointer = STy->getElementType(DefIdx)->isPointerTy();
+                  else
+                    MayBePointer = false;
                 } else {
                   MayBePointer = RetTy->isPointerTy();
                 }
@@ -396,8 +399,8 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
         // type is a pointer type. Loading a plain i32 (e.g., `load i32, ptr @count`)
         // should not be treated as a pointer.
         if (MI.mayLoad()) {
-          if (isLoadOfPotentialPointer(MI, Is64Bit))
-            PotentialPointers.insert(DefReg);
+          // if (isLoadOfPotentialPointer(MI, Is64Bit))
+          PotentialPointers.insert(DefReg);
           continue;
         }
 
@@ -551,8 +554,14 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
                       << printReg(Reg) << "\n");
   }
 
-  // Second pass: insert spill stores before each call
+  // Second pass: insert spill stores before each call.
+  // Within a single basic block, each SSA vreg has a fixed value, so we only
+  // need to spill it before the first call it is live across. Subsequent calls
+  // in the same block will find the spill slot already holding the correct
+  // value. We reset the tracking at each block boundary because different
+  // control-flow paths may not have executed the earlier spill.
   for (auto &MBB : MF) {
+    DenseSet<Register> AlreadySpilledInBB;
     for (auto MII = MBB.begin(); MII != MBB.end(); ++MII) {
       MachineInstr &MI = *MII;
 
@@ -565,11 +574,14 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
 
       LLVM_DEBUG(dbgs() << "  Found call at: " << MI);
 
-      // Find which pointer registers are live across this call
+      // Find which pointer registers are live across this call and have not
+      // already been spilled earlier in this basic block.
       SlotIndex CallIdx = LIS.getInstructionIndex(MI);
       SmallVector<Register, 8> LivePointers;
       for (Register Reg : PointerRegs) {
         if (!NeedSpill.count(Reg))
+          continue;
+        if (AlreadySpilledInBB.count(Reg))
           continue;
         if (LIS.hasInterval(Reg)) {
           auto &LI = LIS.getInterval(Reg);
@@ -579,7 +591,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
       }
 
       if (LivePointers.empty()) {
-        LLVM_DEBUG(dbgs() << "    No live pointers at this call\n");
+        LLVM_DEBUG(dbgs() << "    No live pointers to spill at this call\n");
         continue;
       }
 
@@ -608,6 +620,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
             .addFrameIndex(FI)    // address (frame index)
             .addReg(Reg);         // value to store
 
+        AlreadySpilledInBB.insert(Reg);
         LLVM_DEBUG(dbgs() << "      Spilled "
                           << printReg(Reg)
                           << " to frame slot " << FI << "\n");
