@@ -112,3 +112,45 @@ entry:
   call void @GC_gcollect()
   ret ptr %q
 }
+
+; Test: ptrtoint type information loss through global store/load.
+; When a pointer is ptrtoint'd to integer and stored to a global, loading it
+; back loses the pointer type info (load produces s32, not p0). The pass should
+; still identify the loaded value as a potential pointer because the load's
+; address (CONST_I32 @g_ptr_storage) is a pointer seed, and Phase 2 propagation
+; through loads marks the result as a potential pointer.
+;
+; CHECK-LABEL: test_ptrtoint_global_roundtrip:
+; CHECK: call {{.*}}GC_malloc
+; CHECK: i32.store
+; CHECK: call {{.*}}GC_gcollect
+@g_ptr_storage = global i32 0
+define ptr @test_ptrtoint_global_roundtrip() {
+entry:
+  %p = call ptr @GC_malloc(i32 16)
+  %i = ptrtoint ptr %p to i32
+  store i32 %i, ptr @g_ptr_storage
+  %j = load i32, ptr @g_ptr_storage
+  %q = inttoptr i32 %j to ptr
+  call void @GC_gcollect()
+  ret ptr %q
+}
+
+; Test: GLOBAL_GET should be treated as a pointer seed.
+; WebAssembly globals accessed via global.get often hold pointers (stack pointer,
+; TLS base, GOT entries). Values derived from GLOBAL_GET that are live across
+; calls should be spilled.
+;
+; We test this by loading from a wasm_var address space global (which lowers to
+; GLOBAL_GET) and using the value across a GC call.
+;
+; CHECK-LABEL: test_global_get_seed:
+; CHECK: i32.store
+; CHECK: call {{.*}}GC_gcollect
+@wasm_global = external addrspace(1) global i32
+define i32 @test_global_get_seed() {
+entry:
+  %val = load i32, ptr addrspace(1) @wasm_global
+  call void @GC_gcollect()
+  ret i32 %val
+}

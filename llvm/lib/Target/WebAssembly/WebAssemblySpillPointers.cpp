@@ -392,6 +392,22 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           continue;
         }
 
+        // GLOBAL_GET: WebAssembly global.get instructions can return values
+        // that may be pointers (e.g., __stack_pointer, __tls_base, GOT entries
+        // in PIC mode, or user-defined globals that may contain pointers
+        // stored via ptrtoint). Conservatively treat all I32/I64 GLOBAL_GET
+        // results as potential pointers for GC safety. This check must come
+        // before the general mayLoad check below, because GLOBAL_GET has
+        // mayLoad=1 but should always be treated as a pointer seed regardless
+        // of its MachineMemOperand type.
+        if (Opc == WebAssembly::GLOBAL_GET_I32 ||
+            Opc == WebAssembly::GLOBAL_GET_I32_S ||
+            Opc == WebAssembly::GLOBAL_GET_I64 ||
+            Opc == WebAssembly::GLOBAL_GET_I64_S) {
+          PotentialPointers.insert(DefReg);
+          continue;
+        }
+
         // Values loaded from memory could be pointers, but only if the loaded
         // type is a pointer type. Loading a plain i32 (e.g., `load i32, ptr @count`)
         // should not be treated as a pointer.
@@ -410,6 +426,34 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
           if (ArgIdx < F.arg_size() &&
               F.getArg(ArgIdx)->getType()->isPointerTy()) {
             PotentialPointers.insert(DefReg);
+          }
+          continue;
+        }
+
+        // CONST_I32/CONST_I64 with global address or external symbol operands
+        // represent compile-time addresses of globals/functions, which are
+        // pointers. Plain integer constants (e.g., CONST_I32 42) are NOT
+        // pointer seeds.
+        //
+        // This is important for handling the ptrtoint type information loss:
+        // when a pointer is converted to an integer via ptrtoint and stored
+        // to a global/stack location, loading it back produces a value with
+        // scalar (s32/s64) MachineMemOperand type, losing the pointer-ness.
+        // By seeding the address constants, Phase 2 propagation (which does
+        // not skip loads) will propagate pointer-ness from the load's address
+        // operand to the load result, correctly identifying the loaded value
+        // as a potential pointer.
+        if (Opc == WebAssembly::CONST_I32 ||
+            Opc == WebAssembly::CONST_I32_S ||
+            Opc == WebAssembly::CONST_I64 ||
+            Opc == WebAssembly::CONST_I64_S) {
+          for (unsigned K = 1, KE = MI.getNumOperands(); K < KE; ++K) {
+            const MachineOperand &ConstOp = MI.getOperand(K);
+            if (ConstOp.isGlobal() || ConstOp.isSymbol() ||
+                ConstOp.isMCSymbol()) {
+              PotentialPointers.insert(DefReg);
+              break;
+            }
           }
           continue;
         }
