@@ -144,15 +144,21 @@ static bool isCallSafeForGC(const MachineInstr &MI) {
 ///   - `load i32, ptr @count` → MachineMemOperand type = `s32` (NOT a pointer)
 ///   - `load ptr, ptr @table`  → MachineMemOperand type = `p0` (IS a pointer)
 ///
-/// By checking MMO->getType().isPointer() vs isScalar(), we can avoid
-/// unnecessarily treating integer loads as pointer values, which would cause
-/// false-positive spills.
+/// **Handling ptrtoint type information loss:**
+/// When a pointer is converted to an integer via `ptrtoint` and stored to
+/// memory, loading it back produces a value with scalar type (s32/s64) even
+/// though the value is actually a pointer. To handle this conservatively, we
+/// treat pointer-sized scalar loads as potential pointers. Scalar loads smaller
+/// than the pointer size (s8, s16 on wasm32) cannot be pointers and are safely
+/// excluded. This ensures GC safety: Boehm GC needs to find all live pointers,
+/// and any word-sized value loaded from memory could be a ptrtoint'd pointer.
 ///
 /// If we cannot determine the type (no MachineMemOperand available), we
 /// conservatively assume the loaded value could be a pointer to ensure GC
 /// safety.
 static bool isLoadOfPotentialPointer(const MachineInstr &MI, bool Is64Bit) {
   assert(MI.mayLoad());
+  unsigned PtrSizeInBits = Is64Bit ? 64 : 32;
 
   // Check MachineMemOperand type info
   for (auto *MMO : MI.memoperands()) {
@@ -160,11 +166,14 @@ static bool isLoadOfPotentialPointer(const MachineInstr &MI, bool Is64Bit) {
     if (MemType.isValid()) {
       // LLT preserves pointer vs scalar distinction from LLVM IR.
       // If the memory type is a pointer, the loaded value could be a pointer.
-      // If it's a scalar (e.g., s32 for `load i32`), it's not a pointer.
       if (MemType.isPointer())
         return true;
+      // A pointer-sized scalar could be a ptrtoint'd pointer. We must
+      // conservatively treat it as a potential pointer for GC safety.
+      // Scalars smaller than pointer size (e.g., s8, s16 on wasm32)
+      // cannot hold a full pointer value and are safely excluded.
       if (MemType.isScalar())
-        return false;
+        return MemType.getSizeInBits() >= PtrSizeInBits;
     }
   }
 

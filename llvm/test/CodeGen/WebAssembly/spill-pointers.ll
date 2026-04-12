@@ -119,6 +119,7 @@ entry:
 ; still identify the loaded value as a potential pointer because the load's
 ; address (CONST_I32 @g_ptr_storage) is a pointer seed, and Phase 2 propagation
 ; through loads marks the result as a potential pointer.
+; Use volatile to prevent the optimizer from eliminating the store/load roundtrip.
 ;
 ; CHECK-LABEL: test_ptrtoint_global_roundtrip:
 ; CHECK: call {{.*}}GC_malloc
@@ -129,8 +130,8 @@ define ptr @test_ptrtoint_global_roundtrip() {
 entry:
   %p = call ptr @GC_malloc(i32 16)
   %i = ptrtoint ptr %p to i32
-  store i32 %i, ptr @g_ptr_storage
-  %j = load i32, ptr @g_ptr_storage
+  store volatile i32 %i, ptr @g_ptr_storage
+  %j = load volatile i32, ptr @g_ptr_storage
   %q = inttoptr i32 %j to ptr
   call void @GC_gcollect()
   ret ptr %q
