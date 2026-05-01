@@ -36,7 +36,6 @@
 /// The pass runs after register allocation but before ExplicitLocals, so it
 /// can work with virtual registers and insert machine instructions.
 ///
-/// This pass is enabled by default at optimization levels above -O0.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -82,42 +81,44 @@ namespace {
 ///   set existing memory and do not allocate new memory, so they cannot
 ///   trigger GC. These are frequently emitted by LLVM as external symbol
 ///   calls (MO_ExternalSymbol) rather than global function references.
-// static bool isCallSafeForGC(const MachineInstr &MI) {
-//   assert(MI.isCall());
+//    剔除readone/nounwind调用和已知安全的库函数调用（memcpy/memmove/memset）
+//    为了调试没开这个优化
+static bool isCallSafeForGC(const MachineInstr &MI) {
+  assert(MI.isCall());
 
-//   for (unsigned I = 0, E = MI.getNumOperands(); I < E; ++I) {
-//     const MachineOperand &MO = MI.getOperand(I);
+  for (unsigned I = 0, E = MI.getNumOperands(); I < E; ++I) {
+    const MachineOperand &MO = MI.getOperand(I);
 
-//     if (MO.isGlobal()) {
-//       if (auto *Callee = dyn_cast<Function>(MO.getGlobal())) {
-//         // doesNotAccessMemory() checks for the `readnone` attribute.
-//         // doesNotThrow() checks for the `nounwind` attribute.
-//         // Together they guarantee the call is a pure computation that cannot
-//         // trigger GC. Example: `declare i32 @readnone_callee() readnone nounwind`
-//         if (Callee->doesNotAccessMemory() && Callee->doesNotThrow())
-//           return true;
+    if (MO.isGlobal()) {
+      if (auto *Callee = dyn_cast<Function>(MO.getGlobal())) {
+        // doesNotAccessMemory() checks for the `readnone` attribute.
+        // doesNotThrow() checks for the `nounwind` attribute.
+        // Together they guarantee the call is a pure computation that cannot
+        // trigger GC. Example: `declare i32 @readnone_callee() readnone nounwind`
+        if (Callee->doesNotAccessMemory() && Callee->doesNotThrow())
+          return true;
 
-//         // Known-safe library functions that only read/write memory but never
-//         // allocate, and therefore cannot trigger GC.
-//         StringRef Name = Callee->getName();
-//         if (Name == "memcpy" || Name == "memmove" || Name == "memset")
-//           return true;
-//       }
-//       break;
-//     }
+        // Known-safe library functions that only read/write memory but never
+        // allocate, and therefore cannot trigger GC.
+        StringRef Name = Callee->getName();
+        if (Name == "memcpy" || Name == "memmove" || Name == "memset")
+          return true;
+      }
+      break;
+    }
 
-//     // memcpy/memmove/memset are often lowered as external symbol calls
-//     // (MO_ExternalSymbol) rather than global address calls.
-//     if (MO.isSymbol()) {
-//       StringRef Name = MO.getSymbolName();
-//       if (Name == "memcpy" || Name == "memmove" || Name == "memset")
-//         return true;
-//       break;
-//     }
-//   }
+    // memcpy/memmove/memset are often lowered as external symbol calls
+    // (MO_ExternalSymbol) rather than global address calls.
+    if (MO.isSymbol()) {
+      StringRef Name = MO.getSymbolName();
+      if (Name == "memcpy" || Name == "memmove" || Name == "memset")
+        return true;
+      break;
+    }
+  }
 
-//   return false;
-// }
+  return false;
+}
 
 /// Returns true if a load instruction is loading a value that could be a
 /// pointer. We check the MachineMemOperand's type info to distinguish pointer
@@ -151,20 +152,23 @@ namespace {
 /// If we cannot determine the type (no MachineMemOperand available), we
 /// conservatively assume the loaded value could be a pointer to ensure GC
 /// safety.
+//  为了调试暂时没开这个优化
 static bool isLoadOfPotentialPointer(const MachineInstr &MI, bool Is64Bit) {
   assert(MI.mayLoad());
+  unsigned PtrSizeInBits = Is64Bit ? 64 : 32;
 
+  // 优先读取 MachineMemOperand 上保留下来的原始类型信息
+  // 如果这里能确认 load 的源类型本身就是指针，那么结果寄存器就应当视为Potential Pointer；如果确认只是普通标量，则按位宽进一步判断。
   // Check MachineMemOperand type info
   for (auto *MMO : MI.memoperands()) {
     LLT MemType = MMO->getType();
     if (MemType.isValid()) {
       // LLT preserves pointer vs scalar distinction from LLVM IR.
       // If the memory type is a pointer, the loaded value could be a pointer.
-      // If it's a scalar (e.g., s32 for `load i32`), it's not a pointer.
       if (MemType.isPointer())
         return true;
       if (MemType.isScalar())
-        return false;
+        return  MemType.getSizeInBits() >= PtrSizeInBits;
     }
   }
 
@@ -177,6 +181,8 @@ static bool isLoadOfPotentialPointer(const MachineInstr &MI, bool Is64Bit) {
 /// instruction NOT listed here will conservatively propagate pointer-ness from
 /// its inputs to its output, ensuring no real pointers are missed.
 static bool isDefinitelyNotPointerResult(unsigned Opc) {
+  // 一定破坏指针性的操作符黑名单（可以尝试删一些操作看看会不会解决部分遗漏问题）
+  // 只要操作符在这个集合里，就不再把输入的指针属性传播到输出结果；反之默认继续传播
   switch (Opc) {
   // Multiplication destroys pointer structure
   case WebAssembly::MUL_I32:
@@ -334,7 +340,6 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   // Determine if we're in 32-bit or 64-bit mode
   bool Is64Bit = MF.getSubtarget<WebAssemblySubtarget>().hasAddr64();
   int PtrSize = Is64Bit ? 8 : 4;
-
   // --- Pointer classification via dataflow analysis ---
   // Phase 1: Identify "seed" potential pointers from instructions that can
   // produce pointer values.
@@ -399,8 +404,9 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
         // type is a pointer type. Loading a plain i32 (e.g., `load i32, ptr @count`)
         // should not be treated as a pointer.
         if (MI.mayLoad()) {
+          // 为了调试没加这个优化
           // if (isLoadOfPotentialPointer(MI, Is64Bit))
-          PotentialPointers.insert(DefReg);
+            PotentialPointers.insert(DefReg);
           continue;
         }
 
