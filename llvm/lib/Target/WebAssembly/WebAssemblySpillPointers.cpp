@@ -344,6 +344,7 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
   // Phase 1: Identify "seed" potential pointers from instructions that can
   // produce pointer values.
   DenseSet<Register> PotentialPointers;
+  bool HasCallResultPointer = false;
 
   for (auto &MBB : MF) {
     for (auto &MI : MBB) {
@@ -395,8 +396,10 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
               break;
             }
           }
-          if (MayBePointer)
+          if (MayBePointer) {
             PotentialPointers.insert(DefReg);
+            HasCallResultPointer = true;
+          }
           continue;
         }
 
@@ -424,6 +427,19 @@ bool WebAssemblySpillPointers::runOnMachineFunction(MachineFunction &MF) {
         }
       }
     }
+  }
+
+  // Only proceed if at least one call in this function returns a potential
+  // pointer. This serves as a heuristic for conservative GC: functions that
+  // call allocation routines (e.g., GC_malloc) will have pointer-returning
+  // calls, while functions that only call void-returning helpers (e.g.,
+  // ext_func) do not need shadow stack spilling. When a pointer-returning call
+  // is present, we spill ALL potential pointers (including those from function
+  // arguments and memory loads) across all calls, ensuring the conservative GC
+  // can find every live pointer on the shadow stack.
+  if (!HasCallResultPointer) {
+    LLVM_DEBUG(dbgs() << "  No pointer-returning calls, skipping\n");
+    return false;
   }
 
   // Phase 2: Propagate pointer-ness through dataflow.
