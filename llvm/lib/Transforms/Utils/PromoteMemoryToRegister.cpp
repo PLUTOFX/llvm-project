@@ -61,6 +61,19 @@ STATISTIC(NumDeadAlloca,    "Number of dead alloca's removed");
 STATISTIC(NumPHIInsert,     "Number of PHI nodes inserted");
 
 bool llvm::isAllocaPromotable(const AllocaInst *AI) {
+  if (const auto *PtrTy = dyn_cast<PointerType>(AI->getAllocatedType())) {
+    if (PtrTy->getAddressSpace() == 0) {
+      const Function *F = AI->getFunction();
+      const Module *M = F ? F->getParent() : nullptr;
+      StringRef TargetTriple = M ? M->getTargetTriple() : StringRef();
+      if (TargetTriple.starts_with("wasm32") ||
+          TargetTriple.starts_with("wasm64")) {
+        // Keep pointer allocas on the linear memory stack for wasm so
+        // shadow-stack style GCs can observe them across calls.
+        return false;
+      }
+    }
+  }
   // Only allow direct and non-volatile loads and stores...
   for (const User *U : AI->users()) {
     if (const LoadInst *LI = dyn_cast<LoadInst>(U)) {
